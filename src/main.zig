@@ -90,7 +90,7 @@ fn getZigTarball(
 ) !ZigTarball {
     const resp = try fetch(arena, http_client, ZIG_DOWNLOAD_INDEX_URL);
 
-    var res: ZigTarball = undefined;
+    var found_tarball: ?ZigTarball = null;
     var scanner = std.json.Scanner.initCompleteInput(arena, resp);
     if (.object_begin != try scanner.next()) return error.UnexpectedToken;
     const default_options: std.json.ParseOptions = .{
@@ -103,6 +103,8 @@ fn getZigTarball(
         if (std.ascii.eqlIgnoreCase(version_field, version)) {
             if (.object_begin != try scanner.next()) return error.UnexpectedToken;
 
+            var res: ZigTarball = undefined;
+            res.resource.size = 0;
             while (true) {
                 const field_name = (try getNextFieldName(arena, &scanner)) orelse break;
                 if (std.ascii.eqlIgnoreCase(field_name, "version")) {
@@ -132,16 +134,18 @@ fn getZigTarball(
                     continue;
                 }
             }
-
             if (!found_version) {
                 res.version = version_field;
+            }
+            if (res.resource.size > 0) {
+                found_tarball = res;
             }
 
             break;
         }
     }
 
-    return res;
+    return found_tarball orelse error.TarballNotFound;
 }
 
 fn needsToUpdateZig(arena: Allocator, current_exe: []const u8, remote_version: []const u8) !bool {
@@ -309,17 +313,22 @@ fn unzip(arena: Allocator, out_dir: std.fs.Dir, reader: anytype) !void {
     {
         var zip_file = try cache_root.createFile(&zip_path, .{});
         defer zip_file.close();
+        // unbuffered, shouldn't matter since we're reading in a chunk?
+        var zip_file_writer = zip_file.writer(&.{});
+
         var buf: [4096]u8 = undefined;
         while (true) {
             const len = try reader.readAll(&buf);
             if (len == 0) break;
-            // TODO: adapt to new std.Io.Writer.
             if (@hasDecl(@TypeOf(zip_file), "deprecatedWriter")) {
-                try zip_file.deprecatedWriter().writeAll(buf[0..len]);
+                // TODO: implement buffered writing?
+                try zip_file_writer.interface.writeAll(buf[0..len]);
             } else {
                 try zip_file.writer().writeAll(buf[0..len]);
             }
         }
+
+        try zip_file_writer.end();
     }
 
     var diagnostics: std.zip.Diagnostics = .{ .allocator = arena };
@@ -420,31 +429,32 @@ fn downloadAndExtractZigTarball(
     return out_dir.openDir(expected_extract_dir, .{});
 }
 
-const Target = struct {
+const Config = struct {
     zig_version: []const u8 = MASTER_INDEX,
     platform: []const u8 = CURRENT_PLATFORM,
+    check: bool = false,
 };
 
-fn getTarget(arena: Allocator) !Target {
+fn getConfig(arena: Allocator) !Config {
     var args = try std.process.argsWithAllocator(arena);
     defer args.deinit();
     if (!args.skip()) return .{};
 
-    var target: Target = .{};
+    var config: Config = .{};
 
     var expecting_version = false;
     var expecting_target = false;
-    var should_print_help = false;
+    var show_help = false;
 
     while (args.next()) |arg| {
         if (expecting_version) {
-            target.zig_version = try arena.dupe(u8, arg);
+            config.zig_version = try arena.dupe(u8, arg);
             expecting_version = false;
             continue;
         }
 
         if (expecting_target) {
-            target.platform = try arena.dupe(u8, arg);
+            config.platform = try arena.dupe(u8, arg);
             expecting_target = false;
             continue;
         }
@@ -463,22 +473,31 @@ fn getTarget(arena: Allocator) !Target {
             continue;
         }
 
-        should_print_help = true;
+        if (std.ascii.eqlIgnoreCase(arg, "-c") or
+            std.ascii.eqlIgnoreCase(arg, "--check"))
+        {
+            config.check = true;
+            continue;
+        }
+
+        show_help = true;
         break;
     }
 
-    if (should_print_help) {
+    if (show_help or expecting_version or expecting_target) {
         std.debug.print(
             \\  -h, --help             Prints this message.
             \\  -v, --version <str>    Optional Zig version specification. eg. 0.14.1
             \\  -t, --target <str>     Optional platform target specification. eg. x86_64-windows
+            \\  -c, --check            Check whether the current version matches the latest or specified version by `-v`.
             \\
         ,
             .{},
         );
         return error.Help;
     }
-    return target;
+
+    return config;
 }
 
 pub fn main() !void {
@@ -490,7 +509,7 @@ pub fn main() !void {
 
     const allocator = arena.allocator();
 
-    const target = getTarget(allocator) catch |err| {
+    const config = getConfig(allocator) catch |err| {
         if (err == error.Help) return;
         return err;
     };
@@ -498,11 +517,17 @@ pub fn main() !void {
     var http_client: std.http.Client = .{ .allocator = allocator };
     defer http_client.deinit();
 
-    const remote_zig = try getZigTarball(allocator, &http_client, target.zig_version, target.platform);
+    const remote_zig = try getZigTarball(allocator, &http_client, config.zig_version, config.platform);
     std.log.info("Found remote version: {s}", .{remote_zig.version});
 
     if (!try needsToUpdateZig(allocator, "zig", remote_zig.version)) {
         std.log.info("Zig is up-to-date.", .{});
+        return;
+    }
+
+    // only wanted to check the current version.
+    if (config.check) {
+        std.log.info("Zig is NOT up-to-date.", .{});
         return;
     }
 
@@ -515,7 +540,7 @@ pub fn main() !void {
     var final_dir = try downloadAndExtractZigTarball(allocator, &http_client, remote_zig, out_dir);
     defer final_dir.close();
 
-    const zig_file = if (std.ascii.indexOfIgnoreCase(target.platform, "windows") != null) "zig.exe" else "zig";
+    const zig_file = if (std.ascii.indexOfIgnoreCase(config.platform, "windows") != null) "zig.exe" else "zig";
     _ = final_dir.statFile(zig_file) catch {
         std.log.err("Failed to exract the new Zig compiler.", .{});
         return;
