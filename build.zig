@@ -14,9 +14,9 @@ pub fn build(b: *std.Build) void {
     });
 
     if (target.result.os.tag == .windows) {
-        exe.linkSystemLibrary("crypt32");
-        exe.linkSystemLibrary("advapi32");
-        exe.linkSystemLibrary("ws2_32");
+        exe.root_module.linkSystemLibrary("crypt32", .{});
+        exe.root_module.linkSystemLibrary("advapi32", .{});
+        exe.root_module.linkSystemLibrary("ws2_32", .{});
     }
 
     b.installArtifact(exe);

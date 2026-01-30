@@ -1,18 +1,16 @@
 const builtin = @import("builtin");
 const std = @import("std");
 
-const clap = @import("clap");
-
 const Allocator = std.mem.Allocator;
 
 const ZIG_DOWNLOAD_INDEX_URL = "https://ziglang.org/download/index.json";
 const MASTER_INDEX = "master";
 const CURRENT_PLATFORM = @tagName(builtin.cpu.arch) ++ "-" ++ @tagName(builtin.os.tag);
 
-const DefaultAllocator = struct {
-    backing_allocator: if (need_debug_allocator) std.heap.DebugAllocator(.{}) else Allocator,
+const DefaultAllocator = if (builtin.single_threaded) @compileError("TODO: Handle single-threaded Io.") else struct {
+    backing_allocator: if (builtin.mode == .Debug) std.heap.DebugAllocator(.{}) else Allocator,
 
-    const need_debug_allocator = builtin.mode == .Debug or builtin.single_threaded;
+    const need_debug_allocator = builtin.mode == .Debug;
     const Self = @This();
 
     fn init() Self {
@@ -32,27 +30,139 @@ const DefaultAllocator = struct {
     }
 };
 
+fn getDefaultOutDir(arena: Allocator, io: std.Io, environ: std.process.Environ) ![]const u8 {
+    var env = try environ.createMap(arena);
+    defer env.deinit();
+
+    const zig_bins: *const [2][]const u8 = &.{ "zig", "zig.exe" };
+
+    const path = env.get("PATH") orelse env.get("Path") orelse env.get("path") orelse "";
+    var paths = std.mem.splitScalar(u8, path, std.fs.path.delimiter);
+    while (paths.next()) |p| {
+        if (p.len == 0) continue;
+        for (zig_bins) |zig_bin| {
+            const candidate_path = std.fs.path.join(arena, &.{ p, zig_bin }) catch continue;
+            const file_info = std.Io.Dir.cwd().statFile(io, candidate_path, .{}) catch continue;
+            if (file_info.kind == .file) {
+                return arena.dupe(u8, p);
+            }
+        }
+    }
+
+    return std.process.executableDirPathAlloc(io, arena);
+}
+
+const Config = struct {
+    zig_version: []const u8 = MASTER_INDEX,
+    platform: []const u8 = CURRENT_PLATFORM,
+    check: bool = false,
+    out_dir: []const u8,
+};
+
+fn getConfig(arena: Allocator, args: std.process.Args, default_out_dir: []const u8) !Config {
+    var args_iter = try args.iterateAllocator(arena);
+    defer args_iter.deinit();
+
+    var config: Config = .{ .out_dir = try arena.dupe(u8, default_out_dir) };
+
+    if (!args_iter.skip()) return config;
+
+    var show_help = true;
+    while (args_iter.next()) |arg| {
+        if (std.ascii.eqlIgnoreCase(arg, "-v") or
+            std.ascii.eqlIgnoreCase(arg, "--version"))
+        {
+            const zig_version_arg = args_iter.next() orelse {
+                std.log.err("Missing version argument.", .{});
+                break;
+            };
+            config.zig_version = try arena.dupe(u8, zig_version_arg);
+            continue;
+        }
+
+        if (std.ascii.eqlIgnoreCase(arg, "-t") or
+            std.ascii.eqlIgnoreCase(arg, "--target"))
+        {
+            const target_arg = args_iter.next() orelse {
+                std.log.err("Missing target argument.", .{});
+                break;
+            };
+            config.platform = try arena.dupe(u8, target_arg);
+            continue;
+        }
+
+        if (std.ascii.eqlIgnoreCase(arg, "-c") or
+            std.ascii.eqlIgnoreCase(arg, "--check"))
+        {
+            config.check = true;
+            continue;
+        }
+
+        if (std.ascii.eqlIgnoreCase(arg, "-o") or
+            std.ascii.eqlIgnoreCase(arg, "--out-dir"))
+        {
+            const out_dir_arg = args_iter.next() orelse {
+                std.log.err("Missing out dir argument.", .{});
+                break;
+            };
+            config.out_dir = try arena.dupe(u8, out_dir_arg);
+            continue;
+        }
+
+        break;
+    } else {
+        // all arguments processed successfully
+        show_help = false;
+    }
+
+    if (show_help) {
+        std.debug.print(
+            \\  -h, --help              Prints this message.
+            \\  -v, --version <str>     Optional Zig version specification. eg. 0.14.1
+            \\  -t, --target <str>      Optional platform target specification. eg. x86_64-windows
+            \\  -o, --out-dir <str>     Optional output directory to install Zig into. Defaults to the directory containing the current executable.
+            \\  -c, --check             Check whether the current version matches the latest or specified version by `-v`.
+            \\
+        ,
+            .{},
+        );
+        return error.Help;
+    }
+
+    return config;
+}
+
 const Resource = struct {
     tarball: std.Uri,
     shasum: []const u8,
     size: usize,
 };
 
-fn fetch(allocator: Allocator, http_client: *std.http.Client, url: []const u8) ![]const u8 {
-    var response = std.ArrayList(u8).init(allocator);
-    errdefer response.deinit();
+fn fetch(
+    allocator: Allocator,
+    io: std.Io,
+    http_client: *std.http.Client,
+    url: []const u8,
+) ![]const u8 {
+    var body: std.Io.Writer.Allocating = .init(allocator);
+    defer body.deinit();
+    try body.ensureUnusedCapacity(1024);
 
-    const fetch_res = try http_client.fetch(.{
-        .location = .{ .url = url },
-        .response_storage = .{ .dynamic = &response },
+    var fetch_fut = io.async(std.http.Client.fetch, .{
+        http_client, std.http.Client.FetchOptions{
+            .location = .{ .url = url },
+            .response_writer = &body.writer,
+        },
     });
+    // nothing else can cause early return here so no need to do defer cancel.
+    const fetch_res: std.http.Client.FetchResult = try fetch_fut.await(io);
 
     const status_class = fetch_res.status.class();
     if (status_class == .client_error or status_class == .server_error) {
         return error.FetchFailed;
     }
 
-    return response.toOwnedSlice();
+    return body.toOwnedSlice();
 }
 
 const ZigTarball = struct {
@@ -84,11 +194,14 @@ fn getNextFieldName(arena: Allocator, scanner: *std.json.Scanner) !?[]const u8 {
 
 fn getZigTarball(
     arena: Allocator,
+    io: std.Io,
     http_client: *std.http.Client,
     version: []const u8,
     target: []const u8,
 ) !ZigTarball {
-    const resp = try fetch(arena, http_client, ZIG_DOWNLOAD_INDEX_URL);
+    var resp_fut = io.async(fetch, .{ arena, io, http_client, ZIG_DOWNLOAD_INDEX_URL });
+    // nothing else can cause early return here so no need to do defer cancel.
+    const resp: []const u8 = try resp_fut.await(io);
 
     var found_tarball: ?ZigTarball = null;
     var scanner = std.json.Scanner.initCompleteInput(arena, resp);
@@ -148,9 +261,13 @@ fn getZigTarball(
     return found_tarball orelse error.TarballNotFound;
 }
 
-fn needsToUpdateZig(arena: Allocator, current_exe: []const u8, remote_version: []const u8) !bool {
-    const res = std.process.Child.run(.{
-        .allocator = arena,
+fn needsToUpdateZig(
+    arena: Allocator,
+    io: std.Io,
+    current_exe: []const u8,
+    remote_version: []const u8,
+) !bool {
+    const res = std.process.run(arena, io, .{
         .argv = &.{
             current_exe,
             "version",
@@ -216,9 +333,15 @@ const FileType = enum {
     }
 };
 
-fn getFileTypeFromReq(req: *const std.http.Client.Request, uri_path: []const u8) !FileType {
-    const content_type = req.response.content_type orelse return error.ContentTypeMissing;
+fn getFileTypeFromResp(
+    resp: *const std.http.Client.Response,
+    uri_path: []const u8,
+) !FileType {
+    const head = &resp.head;
+    // Content-Type takes first precedence.
+    const content_type = head.content_type orelse return error.ContentTypeMissing;
 
+    // Extract the MIME type, ignoring charset and boundary directives
     const mime_type_end = std.mem.indexOf(u8, content_type, ";") orelse content_type.len;
     const mime_type = content_type[0..mime_type_end];
 
@@ -253,17 +376,22 @@ fn getFileTypeFromReq(req: *const std.http.Client.Request, uri_path: []const u8)
         return error.UnknownContentType;
     }
 
-    if (req.response.content_disposition) |cd_header| {
+    if (head.content_disposition) |cd_header| {
         return FileType.fromContentDisposition(cd_header) orelse error.UnknownFileType;
     }
 
     return FileType.fromPath(uri_path) orelse error.UnknownFileType;
 }
 
-fn unpackTarball(arena: Allocator, out_dir: std.fs.Dir, reader: anytype) !void {
+fn unpackTarball(
+    arena: Allocator,
+    io: std.Io,
+    out_dir: std.Io.Dir,
+    reader: *std.Io.Reader,
+) !void {
     var diagnostics: std.tar.Diagnostics = .{ .allocator = arena };
 
-    try std.tar.pipeToFileSystem(out_dir, reader, .{
+    try std.tar.pipeToFileSystem(io, out_dir, reader, .{
         .diagnostics = &diagnostics,
         .strip_components = 0,
         .exclude_empty_directories = true,
@@ -273,13 +401,13 @@ fn unpackTarball(arena: Allocator, out_dir: std.fs.Dir, reader: anytype) !void {
         for (diagnostics.errors.items) |item| {
             switch (item) {
                 .unable_to_create_file => |i| {
-                    std.debug.print("Unable to create file({}): {s}\n", .{ i.code, i.file_name });
+                    std.log.err("Unable to create file({}): {s}\n", .{ i.code, i.file_name });
                 },
                 .unable_to_create_sym_link => |i| {
-                    std.debug.print("Unable to create symlink({}): {s} as {s}\n", .{ i.code, i.file_name, i.link_name });
+                    std.log.err("Unable to create symlink({}): {s} as {s}\n", .{ i.code, i.file_name, i.link_name });
                 },
                 .unsupported_file_type => |i| {
-                    std.debug.print("Unsupported file type: {s} type: {}\n", .{ i.file_name, @intFromEnum(i.file_type) });
+                    std.log.err("Unsupported file type: {s} type: {}\n", .{ i.file_name, @intFromEnum(i.file_type) });
                 },
                 .components_outside_stripped_prefix => unreachable, // unreachable with strip_components = 0
             }
@@ -288,219 +416,164 @@ fn unpackTarball(arena: Allocator, out_dir: std.fs.Dir, reader: anytype) !void {
     }
 }
 
-fn unzip(arena: Allocator, out_dir: std.fs.Dir, reader: anytype) !void {
+fn unzip(
+    arena: Allocator,
+    io: std.Io,
+    out_dir: std.Io.Dir,
+    reader: *std.Io.Reader,
+) !void {
     const cache_root = out_dir;
-
     const prefix = "./tmp_";
     const suffix = ".zip";
+    const random_len = @sizeOf(u64) * 2;
 
-    const random_bytes_count = 20;
-    const random_path_len = comptime std.fs.base64_encoder.calcSize(random_bytes_count);
-    var zip_path: [prefix.len + random_path_len + suffix.len]u8 = undefined;
-    @memcpy(zip_path[0..prefix.len], prefix);
-    @memcpy(zip_path[prefix.len + random_path_len ..], suffix);
-    {
-        var random_bytes: [random_bytes_count]u8 = undefined;
-        std.crypto.random.bytes(&random_bytes);
-        _ = std.fs.base64_encoder.encode(
-            zip_path[prefix.len..][0..random_path_len],
-            &random_bytes,
-        );
-    }
+    var zip_path: [prefix.len + random_len + suffix.len]u8 = undefined;
+    zip_path[0..prefix.len].* = prefix.*;
+    zip_path[prefix.len + random_len ..].* = suffix.*;
 
-    defer cache_root.deleteFile(&zip_path) catch {};
+    var zip_file: std.Io.File = while (true) {
+        const random_integer = r: {
+            var x: u64 = undefined;
+            io.random(@ptrCast(&x));
+            break :r x;
+        };
+        zip_path[prefix.len..][0..random_len].* = std.fmt.hex(random_integer);
 
-    {
-        var zip_file = try cache_root.createFile(&zip_path, .{});
-        defer zip_file.close();
-        // unbuffered, shouldn't matter since we're reading in a chunk?
-        var zip_file_writer = zip_file.writer(&.{});
+        break cache_root.createFile(io, &zip_path, .{
+            .exclusive = true,
+            .read = true,
+        }) catch |err| switch (err) {
+            error.PathAlreadyExists => continue,
+            error.Canceled => return error.Canceled,
+            else => return error.FileCreateFailed,
+        };
+    };
+    defer zip_file.close(io);
+    var zip_file_buffer: [4096]u8 = undefined;
+    var zip_file_reader = b: {
+        var zip_file_writer = zip_file.writer(io, &zip_file_buffer);
 
-        var buf: [4096]u8 = undefined;
-        while (true) {
-            const len = try reader.readAll(&buf);
-            if (len == 0) break;
-            if (@hasDecl(@TypeOf(zip_file), "deprecatedWriter")) {
-                // TODO: implement buffered writing?
-                try zip_file_writer.interface.writeAll(buf[0..len]);
-            } else {
-                try zip_file.writer().writeAll(buf[0..len]);
-            }
-        }
+        _ = try reader.streamRemaining(&zip_file_writer.interface);
+        try zip_file_writer.interface.flush();
+        break :b zip_file_writer.moveToReader();
+    };
 
-        try zip_file_writer.end();
-    }
+    errdefer cache_root.deleteFile(io, &zip_path) catch {};
 
     var diagnostics: std.zip.Diagnostics = .{ .allocator = arena };
+    try zip_file_reader.seekTo(0);
+    try std.zip.extract(out_dir, &zip_file_reader, .{
+        .allow_backslashes = true,
+        .diagnostics = &diagnostics,
+    });
 
-    {
-        var zip_file = try cache_root.openFile(&zip_path, .{});
-        defer zip_file.close();
-
-        try std.zip.extract(out_dir, zip_file.seekableStream(), .{
-            .allow_backslashes = true,
-            .diagnostics = &diagnostics,
-        });
-    }
-
-    try cache_root.deleteFile(&zip_path);
+    try cache_root.deleteFile(io, &zip_path);
 }
 
 fn existingZigTarballDir(
     arena: Allocator,
+    io: std.Io,
     expected_extract_dir: []const u8,
     tarball: ZigTarball,
-    out_dir: std.fs.Dir,
-) ?std.fs.Dir {
+    out_dir: std.Io.Dir,
+) ?std.Io.Dir {
     var need_to_close_dir = blk: {
-        const dir = out_dir.openDir(expected_extract_dir, .{}) catch return null;
+        const dir = out_dir.openDir(io, expected_extract_dir, .{}) catch return null;
         const zig_file = if (std.ascii.indexOfIgnoreCase(expected_extract_dir, "windows") != null) "zig.exe" else "zig";
-        const path = dir.realpathAlloc(arena, zig_file) catch break :blk dir;
-        const need_update = needsToUpdateZig(arena, path, tarball.version) catch break :blk dir;
+        const path = dir.realPathFileAlloc(io, zig_file, arena) catch break :blk dir;
+        const need_update = needsToUpdateZig(arena, io, path, tarball.version) catch break :blk dir;
         if (!need_update) {
             return dir;
         }
         break :blk dir;
     };
-    need_to_close_dir.close();
+    need_to_close_dir.close(io);
     return null;
 }
 
-const header_buffer_size = 16 * 1024;
+const tarball_buffer_size = 16 * 1024;
 fn downloadAndExtractZigTarball(
     arena: Allocator,
+    io: std.Io,
     http_client: *std.http.Client,
     tarball: ZigTarball,
-    out_dir: std.fs.Dir,
-) !std.fs.Dir {
-    var server_header_buffer: [header_buffer_size]u8 = undefined;
-    var req = try http_client.open(.GET, tarball.resource.tarball, .{
-        .server_header_buffer = &server_header_buffer,
-    });
+    out_dir: std.Io.Dir,
+) !std.Io.Dir {
+    var req = try http_client.request(.GET, tarball.resource.tarball, .{});
     defer req.deinit();
-    try req.send();
-    try req.wait();
-    if (req.response.status != .ok) {
-        return error.DownloadFailed;
-    }
+
+    var send_fut = io.async(std.http.Client.Request.sendBodiless, .{&req});
+    try send_fut.await(io);
+
+    var resp_fut = io.async(std.http.Client.Request.receiveHead, .{ &req, &.{} });
+    var resp: std.http.Client.Response = try resp_fut.await(io);
+    if (resp.head.status != .ok) return error.DownloadFailed;
 
     const uri_path = try tarball.resource.tarball.path.toRawMaybeAlloc(arena);
-    const file_type = try getFileTypeFromReq(&req, uri_path);
+    const file_type = try getFileTypeFromResp(&resp, uri_path);
+
+    var buffer: [tarball_buffer_size]u8 = undefined;
+    var decompress_resp: std.http.Decompress = undefined;
+    const decompress_buffer = try arena.alloc(u8, resp.head.content_encoding.minBufferCapacity());
+    const reader = resp.readerDecompressing(&buffer, &decompress_resp, decompress_buffer);
 
     const filename = std.fs.path.basename(uri_path);
     const ext = file_type.asExtension();
     const expected_extract_dir = filename[0 .. filename.len - ext.len];
     std.log.info("Downloading and extracting `{s}`...", .{filename});
     // deleting the default extracted dir if exists...
-    if (existingZigTarballDir(arena, expected_extract_dir, tarball, out_dir)) |dir| {
+    if (existingZigTarballDir(arena, io, expected_extract_dir, tarball, out_dir)) |dir| {
+        std.log.warn(
+            "There already exists an up-to-date Zig installation at `{s}`. Skipping download and extraction.",
+            .{expected_extract_dir},
+        );
         return dir;
     } else {
-        out_dir.deleteDir(expected_extract_dir) catch {};
+        out_dir.deleteDir(io, expected_extract_dir) catch {};
     }
+
+    const awaitUnpack = struct {
+        inline fn func(
+            unpackFunc: anytype,
+            inner_arena: Allocator,
+            inner_io: std.Io,
+            inner_out_dir: std.Io.Dir,
+            inner_reader: *std.Io.Reader,
+        ) @typeInfo(@TypeOf(unpackFunc)).@"fn".return_type.? {
+            var fut = inner_io.async(unpackFunc, .{ inner_arena, inner_io, inner_out_dir, inner_reader });
+            return fut.await(inner_io);
+        }
+    }.func;
 
     switch (file_type) {
-        .tar => try unpackTarball(arena, out_dir, req.reader()),
+        .tar => try awaitUnpack(unpackTarball, arena, io, out_dir, reader),
         .@"tar.gz" => {
-            const reader = req.reader();
-            var br = std.io.bufferedReaderSize(std.crypto.tls.max_ciphertext_record_len, reader);
-            var dcp = std.compress.gzip.decompressor(br.reader());
-            try unpackTarball(arena, out_dir, dcp.reader());
+            var flate_buffer: [std.compress.flate.max_window_len]u8 = undefined;
+            var decompress: std.compress.flate.Decompress = .init(reader, .gzip, &flate_buffer);
+            try awaitUnpack(unpackTarball, arena, io, out_dir, &decompress.reader);
         },
         .@"tar.xz" => {
-            const reader = req.reader();
-            var br = std.io.bufferedReaderSize(std.crypto.tls.max_ciphertext_record_len, reader);
-            var dcp = try std.compress.xz.decompress(arena, br.reader());
-            defer dcp.deinit();
-            try unpackTarball(arena, out_dir, dcp.reader());
+            const gpa = arena;
+            var decompress = try std.compress.xz.Decompress.init(reader, gpa, &.{});
+            defer decompress.deinit();
+            try awaitUnpack(unpackTarball, arena, io, out_dir, &decompress.reader);
         },
         .@"tar.zst" => {
-            const window_size = std.compress.zstd.DecompressorOptions.default_window_buffer_len;
-            const window_buffer = try arena.create([window_size]u8);
-            const reader = req.reader();
-            var br = std.io.bufferedReaderSize(std.crypto.tls.max_ciphertext_record_len, reader);
-            var dcp = std.compress.zstd.decompressor(br.reader(), .{
-                .window_buffer = window_buffer,
+            const window_len = std.compress.zstd.default_window_len;
+            const window_buffer = try arena.alloc(u8, window_len + std.compress.zstd.block_size_max);
+            var decompress: std.compress.zstd.Decompress = .init(reader, window_buffer, .{
+                .verify_checksum = false,
+                .window_len = window_len,
             });
-            try unpackTarball(arena, out_dir, dcp.reader());
+            try awaitUnpack(unpackTarball, arena, io, out_dir, &decompress.reader);
         },
-        .zip => try unzip(arena, out_dir, req.reader()),
+        .zip => try awaitUnpack(unzip, arena, io, out_dir, reader),
     }
 
-    return out_dir.openDir(expected_extract_dir, .{});
+    return out_dir.openDir(io, expected_extract_dir, .{});
 }
 
-const Config = struct {
-    zig_version: []const u8 = MASTER_INDEX,
-    platform: []const u8 = CURRENT_PLATFORM,
-    check: bool = false,
-};
-
-fn getConfig(arena: Allocator) !Config {
-    var args = try std.process.argsWithAllocator(arena);
-    defer args.deinit();
-    if (!args.skip()) return .{};
-
-    var config: Config = .{};
-
-    var expecting_version = false;
-    var expecting_target = false;
-    var show_help = false;
-
-    while (args.next()) |arg| {
-        if (expecting_version) {
-            config.zig_version = try arena.dupe(u8, arg);
-            expecting_version = false;
-            continue;
-        }
-
-        if (expecting_target) {
-            config.platform = try arena.dupe(u8, arg);
-            expecting_target = false;
-            continue;
-        }
-
-        if (std.ascii.eqlIgnoreCase(arg, "-v") or
-            std.ascii.eqlIgnoreCase(arg, "--version"))
-        {
-            expecting_version = true;
-            continue;
-        }
-
-        if (std.ascii.eqlIgnoreCase(arg, "-t") or
-            std.ascii.eqlIgnoreCase(arg, "--target"))
-        {
-            expecting_target = true;
-            continue;
-        }
-
-        if (std.ascii.eqlIgnoreCase(arg, "-c") or
-            std.ascii.eqlIgnoreCase(arg, "--check"))
-        {
-            config.check = true;
-            continue;
-        }
-
-        show_help = true;
-        break;
-    }
-
-    if (show_help or expecting_version or expecting_target) {
-        std.debug.print(
-            \\  -h, --help             Prints this message.
-            \\  -v, --version <str>    Optional Zig version specification. eg. 0.14.1
-            \\  -t, --target <str>     Optional platform target specification. eg. x86_64-windows
-            \\  -c, --check            Check whether the current version matches the latest or specified version by `-v`.
-            \\
-        ,
-            .{},
-        );
-        return error.Help;
-    }
-
-    return config;
-}
-
-pub fn main() !void {
+pub fn main(init: std.process.Init.Minimal) !void {
     var default_allocator = DefaultAllocator.init();
     defer default_allocator.deinit();
 
@@ -509,18 +582,66 @@ pub fn main() !void {
 
     const allocator = arena.allocator();
 
-    const config = getConfig(allocator) catch |err| {
-        if (err == error.Help) return;
-        return err;
+    var threaded = std.Io.Threaded.init(allocator, .{ .environ = init.environ });
+    defer threaded.deinit();
+
+    var io = threaded.io();
+
+    const config = config_res: {
+        const default_out_dir = try getDefaultOutDir(allocator, io, init.environ);
+        defer allocator.free(default_out_dir);
+
+        break :config_res getConfig(allocator, init.args, default_out_dir) catch |err| {
+            if (err == error.Help) return;
+            return err;
+        };
     };
 
-    var http_client: std.http.Client = .{ .allocator = allocator };
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const out_dir_path = path_buffer[0..out_dir_res: {
+        break :out_dir_res std.Io.Dir.cwd().realPathFile(io, config.out_dir, path_buffer[0..]) catch |err| {
+            if (err == error.FileNotFound) {
+                try std.Io.Dir.cwd().createDirPath(io, config.out_dir);
+                break :out_dir_res std.Io.Dir.cwd().realPathFile(io, config.out_dir, path_buffer[0..]) catch unreachable;
+            }
+            return err;
+        };
+    }];
+
+    var out_dir = std.Io.Dir.openDirAbsolute(io, out_dir_path, .{}) catch |err| res: {
+        if (err == error.FileNotFound) {
+            // logically shouldn't happen because we created it above, but different os'es might behave differently.
+            try std.Io.Dir.cwd().createDirPath(io, out_dir_path);
+            break :res try std.Io.Dir.openDirAbsolute(io, out_dir_path, .{});
+        }
+        return err;
+    };
+    defer out_dir.close(io);
+
+    var http_client: std.http.Client = .{ .allocator = allocator, .io = io };
     defer http_client.deinit();
 
-    const remote_zig = try getZigTarball(allocator, &http_client, config.zig_version, config.platform);
+    var remote_zig_fut = io.async(getZigTarball, .{
+        allocator,
+        io,
+        &http_client,
+        config.zig_version,
+        config.platform,
+    });
+    var remote_zig: ZigTarball = try remote_zig_fut.await(io);
     std.log.info("Found remote version: {s}", .{remote_zig.version});
 
-    if (!try needsToUpdateZig(allocator, "zig", remote_zig.version)) {
+    const zig_bin = if (std.ascii.indexOfIgnoreCase(config.platform, "windows") != null) "zig.exe" else "zig";
+
+    // I love this cursed syntax!
+    if (!needs_update: {
+        const index = out_dir.realPathFile(io, zig_bin, path_buffer[0..]) catch |err| {
+            if (err == error.FileNotFound) break :needs_update true;
+            return err;
+        };
+        const current_zig_exe_path = path_buffer[0..index];
+        break :needs_update try needsToUpdateZig(allocator, io, current_zig_exe_path, remote_zig.version);
+    }) {
         std.log.info("Zig is up-to-date.", .{});
         return;
     }
@@ -531,24 +652,20 @@ pub fn main() !void {
         return;
     }
 
-    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var download_fut = io.async(downloadAndExtractZigTarball, .{
+        allocator, io, &http_client, remote_zig, out_dir,
+    });
+    var final_dir: std.Io.Dir = try download_fut.await(io);
+    defer final_dir.close(io);
 
-    const out_dir_path = try std.fs.selfExeDirPath(path_buffer[0..]);
-    var out_dir = try std.fs.openDirAbsolute(out_dir_path, .{});
-    defer out_dir.close();
-
-    var final_dir = try downloadAndExtractZigTarball(allocator, &http_client, remote_zig, out_dir);
-    defer final_dir.close();
-
-    const zig_file = if (std.ascii.indexOfIgnoreCase(config.platform, "windows") != null) "zig.exe" else "zig";
-    _ = final_dir.statFile(zig_file) catch {
+    _ = final_dir.statFile(io, zig_bin, .{}) catch {
         std.log.err("Failed to exract the new Zig compiler.", .{});
         return;
     };
 
-    std.log.info("Creating symlink at: `{s}`", .{out_dir_path});
-    const zig_exe_path = try final_dir.realpath(zig_file, path_buffer[0..]);
-    out_dir.deleteFile(zig_file) catch {};
-    try out_dir.symLink(zig_exe_path, zig_file, .{});
+    const zig_exe_path = path_buffer[0..try final_dir.realPathFile(io, zig_bin, path_buffer[0..])];
+    std.log.info("Creating symlink to: `{s}{s}{s}` from `{s}`", .{ out_dir_path, std.fs.path.sep_str, zig_bin, zig_exe_path });
+    out_dir.deleteFile(io, zig_bin) catch {};
+    try out_dir.symLink(io, zig_exe_path, zig_bin, .{});
     std.log.info("Successfully updated zig!", .{});
 }
