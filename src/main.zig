@@ -36,15 +36,23 @@ fn getDefaultOutDir(arena: Allocator, io: std.Io, environ: std.process.Environ) 
 
     const zig_bins: *const [2][]const u8 = &.{ "zig", "zig.exe" };
 
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+
     const path = env.get("PATH") orelse env.get("Path") orelse env.get("path") orelse "";
     var paths = std.mem.splitScalar(u8, path, std.fs.path.delimiter);
     while (paths.next()) |p| {
         if (p.len == 0) continue;
         for (zig_bins) |zig_bin| {
             const candidate_path = std.fs.path.join(arena, &.{ p, zig_bin }) catch continue;
-            const file_info = std.Io.Dir.cwd().statFile(io, candidate_path, .{}) catch continue;
+            const file_info = std.Io.Dir.cwd().statFile(io, candidate_path, .{ .follow_symlinks = false }) catch continue;
             if (file_info.kind == .file) {
                 return arena.dupe(u8, p);
+            } else if (file_info.kind == .sym_link) {
+                const target_info = std.Io.Dir.cwd().statFile(io, candidate_path, .{ .follow_symlinks = true }) catch continue;
+                if (target_info.kind != .file) continue;
+                const target_path = path_buffer[0 .. std.Io.Dir.readLinkAbsolute(io, candidate_path, &path_buffer) catch continue];
+                const target_dir = std.fs.path.dirname(target_path) orelse continue;
+                return arena.dupe(u8, target_dir);
             }
         }
     }
